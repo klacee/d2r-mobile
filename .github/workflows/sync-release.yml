@@ -1,0 +1,65 @@
+name: Sync Releases from Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: '上游仓库 (格式: owner/repo)'
+        required: true
+        default: 'jhaizhou-ops/d2r-mobile'
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Sync tags from upstream
+        run: |
+          UPSTREAM="${{ github.event.inputs.upstream_repo || 'jhaizhou-ops/d2r-mobile' }}"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream --tags
+          git push origin --tags
+
+      - name: Sync releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM="${{ github.event.inputs.upstream_repo || 'jhaizhou-ops/d2r-mobile' }}"
+          TARGET="${{ github.repository }}"
+
+          # 用 --json 拿到真正的 tagName 字段，一行一个
+          tags=$(gh release list --repo "$UPSTREAM" --limit 1000 --json tagName -q '.[].tagName')
+
+          for tag in $tags; do
+            echo "==> 处理 release: $tag"
+
+            if gh release view "$tag" --repo "$TARGET" >/dev/null 2>&1; then
+              echo "已存在，跳过：$tag"
+              continue
+            fi
+
+            mkdir -p "./assets/$tag"
+            gh release download "$tag" --repo "$UPSTREAM" -D "./assets/$tag" || echo "该版本没有附件资源文件"
+
+            title=$(gh release view "$tag" --repo "$UPSTREAM" --json name -q '.name')
+            gh release view "$tag" --repo "$UPSTREAM" --json body -q '.body' > "./assets/$tag/notes.md"
+
+            files=$(find "./assets/$tag" -type f ! -name "notes.md")
+
+            gh release create "$tag" \
+              --repo "$TARGET" \
+              --title "$title" \
+              --notes-file "./assets/$tag/notes.md" \
+              $files
+          done
