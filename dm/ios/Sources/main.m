@@ -17,6 +17,8 @@ static int g_nofile_was, g_nofile_now;   // 启动时的文件描述符软上限
 #include <dirent.h>
 #include <libkern/OSCacheControl.h>
 #include <sys/sysctl.h>
+#include <os/proc.h>
+#include <mach/mach.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -689,6 +691,8 @@ static void host_start(void) {
     { extern int dm_shader_prep_begin(void (^)(void)); static int asked; if (!asked) { asked = 1; if (dm_shader_prep_begin(^{ host_start(); })) return; } }
 #endif
     g_host_up = 1; plog("boot: 场景到前台，起宿主（进程已活 %.1f ms）", since_start());
+    { const char *mw = getenv("DM_TEST_MEMWARN");   // 测试开关 DM_TEST_MEMWARN=<秒>：起宿主后这么多秒，照系统的调法调一次内存告警回调（验那一行日志；系统真发告警的时机造不出来） | test switch DM_TEST_MEMWARN=<seconds>: this many seconds after the host starts, call the memory-warning callback once the way the system does (to check that log line; the moment the system really sends a warning cannot be staged)
+      if (mw && atof(mw) > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(mw) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ UIApplication *app = UIApplication.sharedApplication; [app.delegate applicationDidReceiveMemoryWarning:app]; }); }
     boot_begin();                    // 覆盖层、宿主装载与预取：也等到这里才做（在后台线程，和后面的界面收尾并行） | overlay, host loading and prefetch: also deferred until here (on a background thread, in parallel with the UI wrap-up that follows)
     front_ios_lifecycle_install();   // 过热 / 不自动锁屏 / 亮度（窗口与焦点在 SceneDelegate） | overheating / no auto-lock / brightness (window and focus are in SceneDelegate)
     run_boot();                      // 宿主线程自己写 DONE | The host thread writes DONE itself
@@ -846,15 +850,15 @@ static void run_boot(void);
         [self presentViewController:a animated:YES completion:nil];
     }];
 }
-- (void)downloadOfAssetPack:(BAAssetPack *)p hasProgress:(NSProgress *)g {
+- (void)downloadOfAssetPack:(BAAssetPack *)p hasProgress:(NSProgress *)g API_AVAILABLE(ios(26.0)) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent(); int64_t done = g.completedUnitCount, total = g.totalUnitCount;
     if (now - self.lastT >= 1.0) { self.rate = (done - self.last) / (now - self.lastT); self.last = done; self.lastT = now; }
     NSString *t = [NSString stringWithFormat:T("dmDlProgress"), done / 1e9, total / 1e9, total ? 100.0 * done / total : 0, self.rate / 1e6];
     dispatch_async(dispatch_get_main_queue(), ^{ self.label.text = t; self.bar.progress = total ? (float)done / total : 0; });
 }
-- (void)downloadOfAssetPackFinished:(BAAssetPack *)p { plog("assets: 系统通知资源包下载完成"); dispatch_async(dispatch_get_main_queue(), ^{ [self ready]; }); }
-- (void)downloadOfAssetPackPaused:(BAAssetPack *)p { [self say:T("dmDlPaused")]; }
-- (void)downloadOfAssetPack:(BAAssetPack *)p failedWithError:(NSError *)e { [self fail:@"下载游戏资源" error:e]; }
+- (void)downloadOfAssetPackFinished:(BAAssetPack *)p API_AVAILABLE(ios(26.0)) { plog("assets: 系统通知资源包下载完成"); dispatch_async(dispatch_get_main_queue(), ^{ [self ready]; }); }
+- (void)downloadOfAssetPackPaused:(BAAssetPack *)p API_AVAILABLE(ios(26.0)) { [self say:T("dmDlPaused")]; }
+- (void)downloadOfAssetPack:(BAAssetPack *)p failedWithError:(NSError *)e API_AVAILABLE(ios(26.0)) { [self fail:@"下载游戏资源" error:e]; }
 - (void)ready {
     char why[2048];
     static int started; if (started) return;   // 完成回调与系统的完成通知都会走到这里：只起一次 | Both the completion callback and the system's completion notification end up here: start only once
@@ -948,6 +952,19 @@ static void bg_relaunch_test(void) {
 
 @implementation App
 - (void)applicationWillTerminate:(UIApplication *)a { if (g_host_up) dm_host_shutdown("iOS App 终止"); }
+// 系统内存告警：只记一行，不放任何缓存。用途：玩家被系统按内存终止前不会有任何通知，上一局日志里至少留下前兆与当时的几项读数
+// （常驻、显卡已分配、游戏主堆余量是上次每 300 帧读到的值、离系统内存上限还有多少）。一局最多记 50 行
+// System memory warning: log one line only, release no cache. Purpose: a player gets no notice before the system terminates the app for memory, so the previous session's log at least keeps the precursor and a few readouts at that moment
+// (resident size, GPU allocated, main-heap free space as last read every 300 frames, and how far from the system memory limit). At most 50 lines per session
+- (void)applicationDidReceiveMemoryWarning:(UIApplication *)a {
+    static int n; if (++n > 50) return;
+    task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT; unsigned long long fp = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) fp = vi.phys_footprint >> 20;
+    unsigned long long h[3] = {0, 0, 0}, gpu = 0; void dm_guest_heap_last(unsigned long long *); unsigned long long mtl_gpu_allocated_mb(void);
+    if (g_host_up) { dm_guest_heap_last(h); gpu = mtl_gpu_allocated_mb(); }
+    plog("【内存告警】系统发来内存告警（本局第 %d 次，进程已活 %.0f 秒，applicationState=%ld）：常驻 %llu MB，显卡已分配 %llu MB，游戏堆 %llu MB 余量 %llu MB 最大可分配块 %llu KB，离系统内存上限还有 %llu MB",
+         n, since_start() / 1000.0, (long)a.applicationState, fp, gpu, h[0], h[1], h[2], (unsigned long long)(os_proc_available_memory() >> 20));
+}
 - (void)application:(UIApplication *)a handleEventsForBackgroundURLSession:(NSString *)ident completionHandler:(void (^)(void))done {
     plog("boot: 系统交来后台下载会话 %s 的事件（applicationState=%ld，宿主%s）", ident.UTF8String, (long)a.applicationState, g_host_up ? "在跑" : "没起");
     if ([ident hasSuffix:@".bgtest"]) { plog("后台测试会话：接回"); (void)bg_test_session(); done(); return; }
@@ -961,9 +978,21 @@ static void bg_relaunch_test(void) {
     }
     const char *us = getenv("DM_TEST_UISHOT");   // 只测试用：DM_TEST_UISHOT=<秒>:<名字>，到点把当前窗口存成 Documents/<名字>.png——资源界面、着色器准备页这类系统界面层，游戏内截图截不到 | Test only: DM_TEST_UISHOT=<seconds>:<name> saves the current window to Documents/<name>.png at that time -- UIKit-level screens such as the resource screen and the shader preparation page cannot be captured by the in-game screenshot
     if (us && atof(us) > 0 && strchr(us, ':')) { NSString *fn = @(strchr(us, ':') + 1); dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(us) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *w = nil; for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) if ([sc isKindOfClass:UIWindowScene.class]) for (UIWindow *x in ((UIWindowScene *)sc).windows) if (x.isKeyWindow || !w) w = x;
-        if (!w) { plog("【红】DM_TEST_UISHOT：没有窗口"); return; }
-        UIImage *im = [[[UIGraphicsImageRenderer alloc] initWithBounds:w.bounds] imageWithActions:^(UIGraphicsImageRendererContext *c) { [w drawViewHierarchyInRect:w.bounds afterScreenUpdates:NO]; }];
+        // 所有场景的所有窗口按层级从低到高画进同一张图（系统弹框不一定在主窗口里，只取主窗口会得到一张黑图）；
+        // 另把最上层呈现的界面里每个文字标签的「实际高度 / 排完整段要的高度」记进日志——截图万一仍截不到，截没截断也有数可读
+        // All windows of all scenes are drawn into one image from the lowest level to the highest (a system alert is not necessarily in the main window, and taking only the main window gives a black image);
+        // in addition, for every text label in the topmost presented interface, "actual height / height needed to lay out the whole text" is written to the log - should the screenshot still fail to capture it, whether it is truncated can be read from numbers
+        NSMutableArray<UIWindow *> *ws = [NSMutableArray array]; for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) if ([sc isKindOfClass:UIWindowScene.class]) [ws addObjectsFromArray:((UIWindowScene *)sc).windows];
+        [ws sortUsingComparator:^NSComparisonResult(UIWindow *x, UIWindow *y) { return x.windowLevel < y.windowLevel ? NSOrderedAscending : x.windowLevel > y.windowLevel ? NSOrderedDescending : NSOrderedSame; }];
+        if (!ws.count) { plog("【红】DM_TEST_UISHOT：没有窗口"); return; }
+        CGRect all = CGRectZero; for (UIWindow *x in ws) all = CGRectUnion(all, x.frame);
+        UIImage *im = [[[UIGraphicsImageRenderer alloc] initWithBounds:all] imageWithActions:^(UIGraphicsImageRendererContext *c) { for (UIWindow *x in ws) if (!x.hidden) [x drawViewHierarchyInRect:x.frame afterScreenUpdates:YES]; }];
+        for (UIWindow *x in ws) { UIViewController *top = x.rootViewController; while (top.presentedViewController) top = top.presentedViewController;
+            plog("DM_TEST_UISHOT：窗口 %s 层级 %.0f %.0fx%.0f%s｜最上层 %s", NSStringFromClass(x.class).UTF8String, x.windowLevel, x.frame.size.width, x.frame.size.height, x.hidden ? "（隐藏）" : "", top ? NSStringFromClass(top.class).UTF8String : "无");
+            if (top && top != x.rootViewController) { NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:top.view];
+                while (q.count) { UIView *v = q.firstObject; [q removeObjectAtIndex:0]; [q addObjectsFromArray:v.subviews];
+                    if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length) { UILabel *l = (UILabel *)v; CGFloat need = [l sizeThatFits:CGSizeMake(l.bounds.size.width, CGFLOAT_MAX)].height; BOOL sc = NO; for (UIView *u = l.superview; u; u = u.superview) if ([u isKindOfClass:UIScrollView.class]) sc = YES;
+                        plog("DM_TEST_UISHOT：标签 %.0fx%.0f 排完要高 %.0f 行数上限 %ld%s %s｜%.24s", l.bounds.size.width, l.bounds.size.height, need, (long)l.numberOfLines, sc ? " 在滚动区里" : "", need <= l.bounds.size.height + 0.5 ? "不截断" : "【红】高度不够", l.text.UTF8String); } } } }
         NSString *path = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0] stringByAppendingPathComponent:[fn.lastPathComponent stringByAppendingString:@".png"]];
         plog("DM_TEST_UISHOT：%s %s", path.fileSystemRepresentation, [UIImagePNGRepresentation(im) writeToFile:path atomically:YES] ? "已存" : "【红】没存下");
     }); }
